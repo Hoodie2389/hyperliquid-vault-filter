@@ -35,31 +35,102 @@ import streamlit as st
 
 
 def fetch_vault_summaries() -> List[Dict[str, Any]]:
-    """Fetch vault summaries from the Hyperliquid API.
+    """Fetch vault summaries from Hyperliquid.
 
-    Returns a list of dictionaries where each dictionary describes a
-    single vault.  The API returns many fields beyond what this app
-    displays; the full record is kept in each row under the ``raw``
-    column so that advanced users can inspect it via the JSON viewer.
+    Hyperliquid maintains two sources for vault metadata:
 
-    If the request fails for any reason the function returns an empty
-    list.
+    * ``vaultSummaries`` via the public ``info`` endpoint returns only
+      vaults created in the last two hours.  This is useful for
+      real‑time monitoring but will omit the vast majority of existing
+      vaults.
+    * ``https://stats-data.hyperliquid.xyz/Mainnet/vaults`` serves an
+      hourly snapshot of *all* known vaults.  This file can be large
+      (tens of thousands of entries) and may be delivered either as
+      plain JSON or compressed (e.g. with LZ4 or gzip).  The snapshot
+      endpoint is the authoritative source for a complete vault list.
+
+    This function first attempts to download and decode the snapshot
+    endpoint.  If that fails (due to networking, compression issues or
+    because the environment blocks the host) it falls back to the
+    ``vaultSummaries`` info request.  On any error both attempts
+    gracefully degrade to an empty list.  Errors encountered when
+    fetching the snapshot are swallowed to allow the fallback to run.
     """
-    url = "https://api.hyperliquid.xyz/info"
-    payload = {"type": "vaultSummaries"}
-    headers = {"Content-Type": "application/json"}
+
+    stats_url = "https://stats-data.hyperliquid.xyz/Mainnet/vaults"
+    info_url = "https://api.hyperliquid.xyz/info"
+
+    # First attempt: fetch the hourly snapshot of all vaults.  The
+    # payload may be delivered as plain JSON or as a compressed blob.
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        # The API returns a JSON array of objects.
-        data = response.json()
-        if not isinstance(data, list):
-            return []
-        return data  # type: ignore[return-value]
+        resp = requests.get(stats_url, timeout=30)
+        resp.raise_for_status()
+        data_bytes = resp.content
+
+        # Determine if the response looks like JSON.  Many HTTP
+        # libraries will not set the content type correctly for
+        # snapshots, so we inspect the leading non‑whitespace byte.
+        first_char: Optional[str] = None
+        for b in data_bytes:
+            c = chr(b)
+            if not c.isspace():
+                first_char = c
+                break
+
+        # If the payload does not start with ``{`` or ``[``, attempt
+        # decompression.  Hyperliquid uses LZ4 for large datasets but
+        # gzip may also be used.  If decompression fails we simply
+        # attempt to decode the original bytes as UTF‑8.
+        if first_char not in ("{", "["):
+            decompressed = None
+            # Try LZ4 decompression if available
+            try:
+                import lz4.frame  # type: ignore
+
+                try:
+                    decompressed = lz4.frame.decompress(data_bytes)
+                except Exception:
+                    decompressed = None
+            except ImportError:
+                decompressed = None
+            # Try gzip if LZ4 did not succeed
+            if decompressed is None:
+                try:
+                    import gzip
+
+                    decompressed = gzip.decompress(data_bytes)
+                except Exception:
+                    decompressed = None
+            if decompressed is not None:
+                data_bytes = decompressed
+
+        # Decode bytes to string and parse JSON
+        text = data_bytes.decode("utf-8")
+        snapshot = json.loads(text)
+        if isinstance(snapshot, list) and snapshot:
+            return snapshot  # type: ignore[return-value]
+    except Exception:
+        # Suppress all errors so the fallback can run.  In the
+        # fallback branch any errors will be surfaced via st.error.
+        pass
+
+    # Second attempt: call the info endpoint for recent vaults.  This
+    # returns only vaults created within the last two hours, but it
+    # avoids compression and cross‑origin issues present with the
+    # snapshot endpoint.
+    try:
+        payload = {"type": "vaultSummaries"}
+        headers = {"Content-Type": "application/json"}
+        resp = requests.post(info_url, json=payload, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data  # type: ignore[return-value]
     except Exception as exc:  # noqa: broad-except
-        # Log the error to Streamlit and return empty list
-        st.error(f"Failed to fetch vault summaries: {exc}")
-        return []
+        st.error(f"Failed to fetch vault summaries from both endpoints: {exc}")
+
+    # If both attempts fail return an empty list
+    return []
 
 
 def process_vaults(raw_vaults: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -98,7 +169,18 @@ def process_vaults(raw_vaults: List[Dict[str, Any]]) -> pd.DataFrame:
         # as a fraction and convert to percentage.  Some vaults may
         # express APR already as a percentage.
         apr_value: Optional[float] = None
-        for key in ("apr", "apy"):
+        # The APR may be presented under different keys depending on the
+        # source.  We try common variants in order of preference.  If
+        # none are present the APR defaults to zero.
+        for key in (
+            "apr",  # primary key from info endpoint (fraction or percent)
+            "apy",  # sometimes labelled as APY
+            "apr30d",  # 30‑day annualized return
+            "aprTrailing",  # trailing APR
+            "annualizedReturn",
+            "currentApr",
+            "roiTrailing",  # ratio not percent
+        ):
             val = v.get(key)
             if val is not None:
                 try:
@@ -126,9 +208,13 @@ def process_vaults(raw_vaults: List[Dict[str, Any]]) -> pd.DataFrame:
         if tvl_val is None:
             tvl_val = 0.0
 
-        # Age calculation: look for several possible timestamp keys
+        # Age calculation: look for several possible timestamp keys.  The
+        # stats endpoint uses ``createTimeMillis`` while the info
+        # endpoint may provide ``createdTs`` (seconds), ``createdTime``
+        # (seconds) or ``startTimestamp`` (seconds).  When a value
+        # appears to be in milliseconds (>1e12) it is converted.
         age_days: Optional[float] = None
-        for key in ("createdTs", "createdTime", "startTimestamp", "createdAt"):
+        for key in ("createTimeMillis", "createdTs", "createdTime", "startTimestamp", "createdAt"):
             ts = v.get(key)
             if ts:
                 try:
